@@ -1,0 +1,242 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SMTP 中继探测台</title>
+<style>
+  :root { color-scheme: light; }
+  * { box-sizing: border-box; }
+  body { font-family: "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+         margin: 0; background: #f4f6f8; color: #1f2933; }
+  main { max-width: 1080px; margin: 0 auto; padding: 24px 16px 64px; }
+  h1 { font-size: 22px; margin: 8px 0 4px; }
+  h2 { font-size: 17px; margin: 0 0 12px; }
+  h3 { font-size: 15px; margin: 20px 0 8px; }
+  .muted { color: #6b7280; font-size: 13px; line-height: 1.6; }
+  .panel, .card { background: #fff; border: 1px solid #e5e7eb;
+                  border-radius: 10px; padding: 16px; }
+  .panel { margin: 16px 0; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+          gap: 12px; }
+  fieldset { border: 1px solid #e5e7eb; border-radius: 8px; margin: 0;
+             padding: 10px 12px 12px; }
+  legend { font-size: 13px; font-weight: 600; padding: 0 4px; }
+  label { display: block; font-size: 13px; margin: 6px 0; }
+  label.inline { display: inline-flex; align-items: center; gap: 6px; }
+  input[type=number] { width: 90px; padding: 4px 6px; border: 1px solid #cbd2d9;
+                       border-radius: 6px; font-size: 13px; }
+  button { padding: 7px 14px; border: 1px solid #cbd2d9; border-radius: 6px;
+           background: #fff; cursor: pointer; font-size: 13px; }
+  button:hover { background: #f3f4f6; }
+  button.primary { background: #2563eb; border-color: #2563eb; color: #fff;
+                   font-weight: 600; }
+  button.primary:disabled { background: #93c5fd; border-color: #93c5fd;
+                            cursor: wait; }
+  .presets { margin: 12px 0; display: flex; flex-wrap: wrap; gap: 8px;
+             align-items: center; font-size: 13px; }
+  .row { display: flex; gap: 12px; align-items: center; margin-top: 12px; }
+  .hidden { display: none; }
+  #banner { padding: 12px 16px; border-radius: 8px; font-weight: 600;
+            margin-bottom: 12px; font-size: 15px; }
+  #banner.pass { background: #dcfce7; color: #166534; }
+  #banner.fail { background: #fee2e2; color: #991b1b; }
+  .kv { display: grid; grid-template-columns: 96px 1fr; gap: 4px 10px;
+        font-size: 13px; margin-top: 6px; }
+  .kv dt { color: #6b7280; } .kv dd { margin: 0; word-break: break-all; }
+  .ok { color: #15803d; } .bad { color: #b91c1c; } .na { color: #9ca3af; }
+  .tag { display: inline-block; font-size: 11px; padding: 1px 8px;
+         border-radius: 999px; background: #e0e7ff; color: #3730a3;
+         margin-left: 6px; }
+  table { border-collapse: collapse; width: 100%; font-size: 13px;
+          background: #fff; }
+  th, td { border: 1px solid #e5e7eb; padding: 5px 8px; text-align: left; }
+  th { background: #f9fafb; }
+  code { background: #f3f4f6; padding: 1px 5px; border-radius: 4px;
+         font-size: 12px; }
+  pre { background: #111827; color: #e5e7eb; padding: 10px 12px;
+        border-radius: 8px; font-size: 12px; overflow-x: auto; margin: 6px 0 0; }
+</style>
+</head>
+<body>
+<main>
+  <h1>告警邮件中继探测台</h1>
+  <p class="muted">
+    通过本地 TCP 分别探测两路 SMTP 测试中继。先拨首选；备用等待期满首选问候仍未收齐则并行起拨备用，
+    首选提前失败则立即起拨备用。问候跨分段、跨行（220-…）都会等收齐。
+    只沿首条收齐问候的连接发一次 NOOP，收到 250 判定通过；到达总时限即停止，结束后释放全部连接。
+  </p>
+
+  <section class="panel">
+    <h2>探测参数</h2>
+    <div class="grid">
+      <fieldset>
+        <legend>首选 relay-a</legend>
+        <label>问候延迟(秒) <input type="number" id="a_greeting" step="0.1" min="0" value="0.2"></label>
+        <label>应答延迟(秒) <input type="number" id="a_response" step="0.1" min="0" value="0.1"></label>
+        <label class="inline"><input type="checkbox" id="a_reset"> 建连后立即复位（模拟失败）</label>
+      </fieldset>
+      <fieldset>
+        <legend>备用 relay-b</legend>
+        <label>问候延迟(秒) <input type="number" id="b_greeting" step="0.1" min="0" value="0.2"></label>
+        <label>应答延迟(秒) <input type="number" id="b_response" step="0.1" min="0" value="0.1"></label>
+        <label class="inline"><input type="checkbox" id="b_reset"> 建连后立即复位（模拟失败）</label>
+      </fieldset>
+      <fieldset>
+        <legend>调度</legend>
+        <label>备用起拨前等待(秒) <input type="number" id="backup_wait" step="0.1" min="0" value="1.0"></label>
+        <label>探测总时限(秒) <input type="number" id="total_timeout" step="0.1" min="0.2" value="5.0"></label>
+      </fieldset>
+    </div>
+    <div class="presets">
+      场景预置：
+      <button data-preset="normal">① 正常（首选胜出）</button>
+      <button data-preset="slow">② 首选问候慢 → 并行拨备用</button>
+      <button data-preset="reset">③ 首选复位 → 立即拨备用</button>
+      <button data-preset="timeout">④ 两路都慢 → 总时限停止</button>
+      <button data-preset="slow_noop">⑤ NOOP 应答超时限</button>
+    </div>
+    <div class="row">
+      <button id="run" class="primary">开始探测</button>
+      <span id="busy" class="muted"></span>
+    </div>
+  </section>
+
+  <section id="result" class="hidden">
+    <div id="banner"></div>
+    <div class="grid">
+      <div class="card" id="card-a"></div>
+      <div class="card" id="card-b"></div>
+    </div>
+    <h3>NOOP 验证</h3>
+    <div class="card" id="noop"></div>
+    <h3>事件时间线</h3>
+    <table id="events">
+      <thead><tr><th style="width:110px">相对时间(s)</th><th>事件</th></tr></thead>
+      <tbody></tbody>
+    </table>
+    <h3>中继侧连接计数（核对连接释放）</h3>
+    <div class="card" id="stats"></div>
+    <p class="muted">注：计数为探测结束时刻的快照；中继侧会话协程察觉断开略有延迟，"已释放"可能稍后几秒才与"接受连接"对齐。</p>
+  </section>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const OUTCOME_TEXT = {
+  pass: "探测通过：胜出连接 NOOP 收到 250",
+  timeout: "探测失败：到达总时限，未收齐问候",
+  no_greeting: "探测失败：两路均未收齐问候",
+  noop_failed: "探测失败：NOOP 未获应答",
+  noop_bad_reply: "探测失败：NOOP 应答非 250",
+};
+const PRESETS = {
+  normal:    { a:[0.2,0.1,false], b:[0.2,0.1,false], wait:1.0, total:5 },
+  slow:      { a:[2.5,0.1,false], b:[0.3,0.1,false], wait:1.0, total:6 },
+  reset:     { a:[0.2,0.1,true ], b:[0.3,0.1,false], wait:5.0, total:6 },
+  timeout:   { a:[10 ,0.1,false], b:[10 ,0.1,false], wait:1.0, total:3 },
+  slow_noop: { a:[0.2,3.0,false], b:[0.2,0.1,false], wait:2.0, total:1.5 },
+};
+
+document.querySelectorAll("[data-preset]").forEach((btn) => {
+  btn.addEventListener("click", () => {
+    const p = PRESETS[btn.dataset.preset];
+    $("a_greeting").value = p.a[0]; $("a_response").value = p.a[1]; $("a_reset").checked = p.a[2];
+    $("b_greeting").value = p.b[0]; $("b_response").value = p.b[1]; $("b_reset").checked = p.b[2];
+    $("backup_wait").value = p.wait; $("total_timeout").value = p.total;
+  });
+});
+
+function num(id) { return parseFloat($(id).value); }
+
+function esc(s) {
+  return String(s).replace(/[&<>"]/g, (c) =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+}
+
+function fmtConnect(c) {
+  if (!c) return '<span class="na">未拨号</span>';
+  return c.ok ? `<span class="ok">成功</span> @ ${c.at}s`
+              : `<span class="bad">失败</span> @ ${c.at}s：${esc(c.error)}`;
+}
+function fmtGreeting(g) {
+  if (!g) return '<span class="na">未到问候阶段 / 未收齐</span>';
+  return g.ok ? `<span class="ok">收齐</span> @ ${g.at}s，代码 ${g.code}`
+              : `<span class="bad">失败</span> @ ${g.at}s：${esc(g.error)}`;
+}
+
+function renderRelay(key, r) {
+  const title = key === "a" ? "首选 relay-a" : "备用 relay-b";
+  let status;
+  if (!r.dialed) status = '<span class="na">未起拨</span>';
+  else if (r.note.includes("胜出")) status = '<span class="ok">胜出</span>';
+  else if (r.cancelled) status = '<span class="na">落选，拨号已取消</span>';
+  else status = `<span class="na">${esc(r.note || "落选")}</span>`;
+  const lines = r.greeting && r.greeting.ok
+    ? `<pre>${esc(r.greeting.lines.join("\n"))}</pre>` : "";
+  return `<h2>${title}<span class="tag">${r.role === "primary" ? "首选" : "备用"}</span></h2>
+    <dl class="kv">
+      <dt>拨号</dt><dd>${r.dialed ? "@" + r.dial_at + "s" : "—"}</dd>
+      <dt>建连</dt><dd>${fmtConnect(r.connect)}</dd>
+      <dt>问候</dt><dd>${fmtGreeting(r.greeting)}</dd>
+      <dt>结局</dt><dd>${status}${r.closed ? '，连接已关闭' : ""}</dd>
+    </dl>${lines}`;
+}
+
+function renderNoop(n) {
+  if (!n.sent) return '<span class="na">未发送：没有连接收齐问候</span>';
+  const head = `沿 <b>${esc(n.relay_name)}</b> 发送一次 <code>NOOP</code>：`;
+  if (n.ok) return head + ` <span class="ok">收到 250，通过</span><pre>${esc(n.lines.join("\n"))}</pre>`;
+  if (n.lines) return head + ` <span class="bad">应答 ${n.code}，非 250</span><pre>${esc(n.lines.join("\n"))}</pre>`;
+  return head + ` <span class="bad">失败：${esc(n.error)}</span>`;
+}
+
+function renderStats(stats) {
+  if (!stats) return '<span class="na">未取到</span>';
+  return Object.entries(stats).map(([k, s]) => {
+    if (!s) return `<div>${k}: 未取到</div>`;
+    return `<div><b>${k === "a" ? "relay-a" : "relay-b"}</b>：
+      接受连接 ${s.accepted}，已释放 ${s.closed}，问候发出 ${s.greeted}，
+      NOOP ${s.noop}，RST ${s.reset}</div>`;
+  }).join("");
+}
+
+$("run").addEventListener("click", async () => {
+  const body = {
+    relay_a: { greeting_delay: num("a_greeting"), response_delay: num("a_response"), reset: $("a_reset").checked },
+    relay_b: { greeting_delay: num("b_greeting"), response_delay: num("b_response"), reset: $("b_reset").checked },
+    backup_wait: num("backup_wait"),
+    total_timeout: num("total_timeout"),
+  };
+  $("run").disabled = true;
+  $("busy").textContent = "探测中……";
+  try {
+    const resp = await fetch("/api/probe", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.detail || resp.statusText);
+    $("result").classList.remove("hidden");
+    const pass = data.outcome === "pass";
+    $("banner").className = pass ? "pass" : "fail";
+    $("banner").textContent =
+      (OUTCOME_TEXT[data.outcome] || data.outcome) + `（总耗时 ${data.duration}s）`;
+    $("card-a").innerHTML = renderRelay("a", data.relays.a);
+    $("card-b").innerHTML = renderRelay("b", data.relays.b);
+    $("noop").innerHTML = renderNoop(data.noop);
+    $("stats").innerHTML = renderStats(data.relay_stats);
+    document.querySelector("#events tbody").innerHTML = data.events
+      .map((e) => `<tr><td>${e.t.toFixed(3)}</td><td>${esc(e.msg)}</td></tr>`).join("");
+  } catch (e) {
+    $("result").classList.remove("hidden");
+    $("banner").className = "fail";
+    $("banner").textContent = "探测请求失败：" + e.message;
+  } finally {
+    $("run").disabled = false;
+    $("busy").textContent = "";
+  }
+});
+</script>
+</body>
+</html>

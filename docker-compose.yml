@@ -1,0 +1,37 @@
+name: smtp-probe
+
+services:
+  relay-a:
+    build: ./relay
+    environment:
+      RELAY_NAME: relay-a
+      SMTP_PORT: "2525"
+      CTRL_PORT: "8081"
+    ports:
+      - "2525:2525"   # SMTP
+      - "8081:8081"   # 控制口
+
+  relay-b:
+    build: ./relay
+    environment:
+      RELAY_NAME: relay-b
+      SMTP_PORT: "2525"
+      CTRL_PORT: "8081"
+    ports:
+      - "2526:2525"   # SMTP
+      - "8082:8081"   # 控制口
+
+  app:
+    build: ./app
+    environment:
+      RELAY_A_HOST: relay-a
+      RELAY_A_SMTP_PORT: "2525"
+      RELAY_A_CTRL: http://relay-a:8081
+      RELAY_B_HOST: relay-b
+      RELAY_B_SMTP_PORT: "2525"
+      RELAY_B_CTRL: http://relay-b:8081
+    ports:
+      - "8000:8000"
+    depends_on:
+      - relay-a
+      - relay-b
