@@ -41,6 +41,19 @@
             margin-bottom: 12px; font-size: 15px; }
   #banner.pass { background: #dcfce7; color: #166534; }
   #banner.fail { background: #fee2e2; color: #991b1b; }
+  #trial_banner { padding: 12px 16px; border-radius: 8px; font-weight: 600;
+                  margin-bottom: 12px; font-size: 15px; }
+  #trial_banner.ok { background: #dcfce7; color: #166534; }
+  #trial_banner.warn { background: #fef3c7; color: #92400e; }
+  #trial_banner.bad { background: #fee2e2; color: #991b1b; }
+  .st-accepted { color: #15803d; font-weight: 600; }
+  .st-tempfail { color: #b45309; font-weight: 600; }
+  .st-reject { color: #b91c1c; font-weight: 600; }
+  .st-unverified { color: #1d4ed8; font-weight: 600; }
+  #rcpt_rows label { display: grid; grid-template-columns: 1fr auto;
+                     align-items: center; gap: 8px; margin: 4px 0; }
+  #rcpt_rows select { font-size: 12px; padding: 2px 4px; }
+  .multi { font-size: 11px; color: #6d28d9; }
   .kv { display: grid; grid-template-columns: 96px 1fr; gap: 4px 10px;
         font-size: 13px; margin-top: 6px; }
   .kv dt { color: #6b7280; } .kv dd { margin: 0; word-break: break-all; }
@@ -66,6 +79,66 @@
     首选提前失败则立即起拨备用。问候跨分段、跨行（220-…）都会等收齐。
     只沿首条收齐问候的连接发一次 NOOP，收到 250 判定通过；到达总时限即停止，结束后释放全部连接。
   </p>
+
+  <section class="panel">
+    <h2>首选中继批量试投（PIPELINING）</h2>
+    <p class="muted">
+      沿首选 relay-a 建一条真实 SMTP 连接，一次 write 连发
+      <code>MAIL FROM</code>、各 <code>RCPT TO</code> 与 <code>DATA</code>；
+      RCPT 应答逐个收齐（含跨 TCP 分段的多行应答）并按原命令顺序配对，收到 <code>354</code> 才发正文。
+      每个样例地址可设为接收、暂拒（451）或永久拒收（550）；正文最终应答可模拟回 250、回 451，
+      或发出半条应答后断连。RCPT 被拒的保留原结论，通过的以正文最终应答为准；最终应答不完整时标"待核"。
+      <b>可重投名单只列明确暂拒的地址。</b>
+    </p>
+    <div class="grid">
+      <fieldset>
+        <legend>本地样例地址策略</legend>
+        <div id="rcpt_rows" class="muted">地址清单加载中……</div>
+      </fieldset>
+      <fieldset>
+        <legend>正文最终应答</legend>
+        <label class="inline"><input type="radio" name="data_final" value="accept" checked>
+          回 250（接收）</label>
+        <label class="inline"><input type="radio" name="data_final" value="tempfail">
+          回 451（暂拒，可重投）</label>
+        <label class="inline"><input type="radio" name="data_final" value="half_close">
+          半条最终应答后断连（待核）</label>
+        <label>试投总时限(秒) <input type="number" id="trial_timeout"
+               step="1" min="1" max="60" value="10" style="width:80px"></label>
+      </fieldset>
+    </div>
+    <div class="presets">
+      试投预置：
+      <button data-trial-preset="mixed">Ⓐ 收件人混合应答 + 正文 250</button>
+      <button data-trial-preset="tempfail">Ⓑ 全部接收 + 正文 451 暂拒</button>
+      <button data-trial-preset="halfclose">Ⓒ 全部接收 + 末尾断连（待核）</button>
+    </div>
+    <div class="row">
+      <button id="run_trial" class="primary">开始批量试投</button>
+      <span id="trial_busy" class="muted"></span>
+    </div>
+  </section>
+
+  <section id="trial_result" class="hidden">
+    <div id="trial_banner"></div>
+    <h3>逐收件结果（按 RCPT TO 原顺序）</h3>
+    <table id="trial_table">
+      <thead><tr>
+        <th>收件地址</th><th>设置策略</th><th>RCPT 应答</th>
+        <th>RCPT 结论</th><th>正文最终码</th><th>最终结论</th><th>可重投</th>
+      </tr></thead>
+      <tbody></tbody>
+    </table>
+    <h3>可重投名单（仅明确暂拒）</h3>
+    <div class="card" id="resendable"></div>
+    <h3>试投时间线</h3>
+    <table id="trial_events">
+      <thead><tr><th style="width:110px">相对时间(s)</th><th>事件</th></tr></thead>
+      <tbody></tbody>
+    </table>
+    <h3>首选中继侧计数</h3>
+    <div class="card" id="trial_stats"></div>
+  </section>
 
   <section class="panel">
     <h2>探测参数</h2>
@@ -235,6 +308,153 @@ $("run").addEventListener("click", async () => {
   } finally {
     $("run").disabled = false;
     $("busy").textContent = "";
+  }
+});
+
+/* ===================== 批量试投 ===================== */
+const POLICY_TEXT = { accept: "接收 (250)", tempfail: "暂拒 (451)", reject: "永久拒收 (550)" };
+const STATUS_TEXT = {
+  accepted: "已接收", tempfail: "暂拒（可重投）", reject: "永久拒收",
+  unverified: "待核（最终应答不完整）",
+};
+const TRIAL_OUTCOME_TEXT = {
+  final_250: "试投完成：正文最终应答 250",
+  final_tempfail: "试投完成：正文最终应答 451（暂拒）",
+  final_reject: "试投完成：正文最终应答 5xx",
+  final_incomplete: "试投异常：正文发完后未收到完整最终应答，通过 RCPT 的地址已标待核",
+  pre_data_failed: "试投提前终止：未进入正文阶段",
+  connection_failed: "试投失败：连接中断",
+  timeout: "试投失败：超过总时限",
+};
+// 预置：默认 5 个样例地址的策略矩阵
+const TRIAL_PRESETS = {
+  mixed: {
+    policy: ["accept", "accept", "accept", "tempfail", "reject"],
+    data_final: "accept",
+  },
+  tempfail: {
+    policy: ["accept", "accept", "accept", "accept", "accept"],
+    data_final: "tempfail",
+  },
+  halfclose: {
+    policy: ["accept", "accept", "accept", "accept", "accept"],
+    data_final: "half_close",
+  },
+};
+let trialAddresses = [];
+
+async function loadTrialConfig() {
+  try {
+    const resp = await fetch("/api/trial-config");
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.detail || resp.statusText);
+    trialAddresses = data.addresses;
+    const rows = trialAddresses.map((addr) => {
+      const cur = data.rcpt_policy[addr] || "accept";
+      const multi = addr === "ops@multiline.test"
+        ? '<span class="multi">（RCPT 走跨分段多行应答）</span>' : "";
+      return `<label><span>${esc(addr)} ${multi}</span>
+        <select data-addr="${esc(addr)}">
+          <option value="accept"${cur === "accept" ? " selected" : ""}>接收 (250)</option>
+          <option value="tempfail"${cur === "tempfail" ? " selected" : ""}>暂拒 (451)</option>
+          <option value="reject"${cur === "reject" ? " selected" : ""}>永久拒收 (550)</option>
+        </select></label>`;
+    }).join("");
+    $("rcpt_rows").innerHTML = rows;
+    document.querySelectorAll('input[name=data_final]').forEach((rb) => {
+      rb.checked = rb.value === data.data_final;
+    });
+  } catch (e) {
+    $("rcpt_rows").innerHTML =
+      `<span class="bad">地址清单加载失败：${esc(e.message)}</span>`;
+  }
+}
+loadTrialConfig();
+
+document.querySelectorAll("[data-trial-preset]").forEach((btn) => {
+  btn.addEventListener("click", () => {
+    const p = TRIAL_PRESETS[btn.dataset.trialPreset];
+    const selects = document.querySelectorAll("#rcpt_rows select");
+    selects.forEach((sel, i) => { sel.value = p.policy[i] || "accept"; });
+    document.querySelectorAll('input[name=data_final]').forEach((rb) => {
+      rb.checked = rb.value === p.data_final;
+    });
+  });
+});
+
+function renderTrialRecipients(recipients) {
+  return recipients.map((r) => {
+    const multi = r.rcpt_multiline ? ' <span class="multi">多行</span>' : "";
+    const codeTxt = r.rcpt_code + multi;
+    const finalCode = r.final_code === null || r.final_code === undefined
+      ? '<span class="na">—</span>' : r.final_code;
+    return `<tr>
+      <td>${esc(r.address)}</td>
+      <td>${esc(POLICY_TEXT[r.configured_policy] || r.configured_policy)}</td>
+      <td>${esc(codeTxt)}</td>
+      <td class="st-${r.rcpt_status}">${esc(STATUS_TEXT[r.rcpt_status] || r.rcpt_status)}</td>
+      <td>${finalCode}</td>
+      <td class="st-${r.final_status}">${esc(STATUS_TEXT[r.final_status] || r.final_status)}</td>
+      <td>${r.resendable ? '<span class="st-tempfail">是</span>' : "否"}</td>
+    </tr>`;
+  }).join("");
+}
+
+function renderTrialStats(s) {
+  if (!s) return '<span class="na">未取到</span>';
+  return `接受连接 ${s.accepted}，已释放 ${s.closed}；MAIL FROM ${s.mail_from}，
+    RCPT 共 ${s.rcpt_total}（250×${s.rcpt_accept} / 4xx×${s.rcpt_tempfail}
+    / 5xx×${s.rcpt_reject}，其中分段多行 ${s.multiline_rcpt}）；
+    DATA ${s.data_sessions}，最终 250×${s.final_250} / 451×${s.final_451}
+    / 半条断连×${s.half_close}`;
+}
+
+$("run_trial").addEventListener("click", async () => {
+  const rcpt_policy = {};
+  document.querySelectorAll("#rcpt_rows select").forEach((sel) => {
+    rcpt_policy[sel.dataset.addr] = sel.value;
+  });
+  if (!Object.keys(rcpt_policy).length) {
+    alert("地址清单尚未加载完成，请稍后重试");
+    return;
+  }
+  const data_final = document.querySelector('input[name=data_final]:checked').value;
+  const body = {
+    rcpt_policy, data_final,
+    timeout: parseFloat($("trial_timeout").value) || 10,
+  };
+  $("run_trial").disabled = true;
+  $("trial_busy").textContent = "试投中……";
+  try {
+    const resp = await fetch("/api/trial", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.detail || resp.statusText);
+    $("trial_result").classList.remove("hidden");
+    const cls = data.outcome === "final_250" ? "ok"
+      : data.outcome === "final_incomplete" || data.outcome === "final_tempfail" ? "warn"
+      : "bad";
+    $("trial_banner").className = cls;
+    $("trial_banner").textContent =
+      (TRIAL_OUTCOME_TEXT[data.outcome] || data.outcome) +
+      `（耗时 ${data.duration}s，PIPELINING：${data.pipelining ? "是" : "否"}）`;
+    document.querySelector("#trial_table tbody").innerHTML =
+      renderTrialRecipients(data.recipients);
+    $("resendable").innerHTML = data.resendable.length
+      ? data.resendable.map((a) => `<code>${esc(a)}</code>`).join(" ")
+      : '<span class="na">无（没有明确暂拒的地址）</span>';
+    document.querySelector("#trial_events tbody").innerHTML = data.events
+      .map((e) => `<tr><td>${e.t.toFixed(3)}</td><td>${esc(e.msg)}</td></tr>`).join("");
+    $("trial_stats").innerHTML = renderTrialStats(data.relay_stats);
+  } catch (e) {
+    $("trial_result").classList.remove("hidden");
+    $("trial_banner").className = "bad";
+    $("trial_banner").textContent = "试投请求失败：" + e.message;
+  } finally {
+    $("run_trial").disabled = false;
+    $("trial_busy").textContent = "";
   }
 });
 </script>

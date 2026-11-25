@@ -16,7 +16,7 @@ from pathlib import Path
 import httpx
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 def _env(name: str, default: str) -> str:
@@ -54,6 +54,34 @@ class ProbeReq(BaseModel):
     total_timeout: float = Field(5.0, ge=0.2, le=180, description="探测总时限(秒)")
 
 
+POLICY_ACCEPT = "accept"
+POLICY_TEMPFAIL = "tempfail"
+POLICY_REJECT = "reject"
+DATA_FINAL_CHOICES = ("accept", "tempfail", "half_close")
+
+
+class TrialReq(BaseModel):
+    # 地址 -> accept（接收）/ tempfail（暂拒 451）/ reject（永久拒收 550）
+    rcpt_policy: dict[str, str]
+    data_final: str = Field("accept", description="正文最终应答模式")
+    timeout: float = Field(10.0, ge=1.0, le=60.0, description="试投总时限(秒)")
+
+    @field_validator("rcpt_policy")
+    @classmethod
+    def _check_policy(cls, v: dict) -> dict:
+        for addr, p in v.items():
+            if p not in (POLICY_ACCEPT, POLICY_TEMPFAIL, POLICY_REJECT):
+                raise ValueError(f"地址 {addr} 的策略非法: {p}")
+        return v
+
+    @field_validator("data_final")
+    @classmethod
+    def _check_data_final(cls, v: str) -> str:
+        if v not in DATA_FINAL_CHOICES:
+            raise ValueError(f"data_final 非法: {v}")
+        return v
+
+
 app = FastAPI(title="SMTP 中继探测台")
 INDEX_HTML = Path(__file__).with_name("index.html")
 probe_lock = asyncio.Lock()  # 中继配置是全局的，探测串行执行避免互相改配置
@@ -74,6 +102,219 @@ async def read_smtp_reply(reader: asyncio.StreamReader):
             continue  # 多行续行，继续等
         if len(lines) >= MAX_REPLY_LINES:
             raise ValueError("应答行数超限，判定格式异常")
+
+
+async def read_final_reply(reader: asyncio.StreamReader):
+    """读正文最终应答；EOF 时若已读到半条（无 CRLF 的残行），按"应答不完整"上报。
+
+    返回 (code|None, lines, partial)：
+    - 正常收齐终行：code 为三位码，partial 为 None；
+    - 断连且一行都没收到：抛 EOFError；
+    - 断连但留下半条应答：code=None，partial 为残行原文。
+    """
+    lines = []
+    while True:
+        raw = await reader.readline()  # 跨分段拼行；残行（无 CRLF）在 EOF 时也会吐出
+        if not raw:
+            if not lines:
+                raise EOFError("正文发完后对端直接断连，没有任何最终应答")
+            return None, lines, lines[-1]
+        text = raw.decode("utf-8", "replace").rstrip("\r\n")
+        lines.append(text)
+        if len(text) >= 4 and text[:3].isdigit() and text[3] == " ":
+            return int(text[:3]), lines, None
+        if len(text) >= 4 and text[:3].isdigit() and text[3] == "-":
+            continue
+        if len(lines) >= MAX_REPLY_LINES:
+            raise ValueError("应答行数超限，判定格式异常")
+
+
+class TrialError(Exception):
+    """试投在正文开始前失败（连接/问候/EHLO/MAIL/RCPT/DATA 354 阶段）。"""
+
+
+async def run_trial(req: TrialReq) -> dict:
+    """沿首选 relay-a 做一次完整批量试投（PIPELINING），返回逐收件结果。"""
+    loop = asyncio.get_running_loop()
+    t0 = loop.time()
+    deadline = t0 + req.timeout
+    events: list[dict] = []
+    cfg = RELAYS["a"]
+
+    def now() -> float:
+        return round(loop.time() - t0, 3)
+
+    def log(msg: str) -> None:
+        events.append({"t": now(), "msg": msg})
+
+    async def read_with_deadline(reader, final=False):
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            raise TimeoutError("已超过试投总时限")
+        if final:
+            return await asyncio.wait_for(
+                read_final_reply(reader), timeout=remaining)
+        return await asyncio.wait_for(read_smtp_reply(reader), timeout=remaining)
+
+    addresses = list(req.rcpt_policy.keys())
+    recipients = []  # 逐收件结果，顺序与 RCPT TO 一致
+    result = {
+        "outcome": None,
+        "duration": None,
+        "relay": cfg["name"],
+        "addresses": addresses,
+        "pipelining": True,
+        "mail_from": None,
+        "data_reply": None,
+        "final_reply": None,
+        "recipients": recipients,
+        "resendable": [],
+        "events": events,
+    }
+    writer = None
+    try:
+        log(f"连接首选中继 {cfg['host']}:{cfg['smtp_port']}")
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(cfg["host"], cfg["smtp_port"]),
+            timeout=deadline - loop.time())
+
+        code, lines = await read_with_deadline(reader)
+        if code != 220:
+            raise TrialError(f"问候码异常: {code}")
+        log(f"220 问候收齐（{len(lines)} 行）")
+
+        # EHLO：确认对端声明 PIPELINING
+        writer.write(b"EHLO probe.local\r\n")
+        await writer.drain()
+        code, lines = await read_with_deadline(reader)
+        if code != 250:
+            raise TrialError(f"EHLO 被拒: {code}")
+        caps = " ".join(lines).upper()
+        result["ehlo_pipelining"] = "PIPELINING" in caps
+        log(f"EHLO 应答 {code}，PIPELINING 能力: {result['ehlo_pipelining']}")
+
+        # 一条真实连接、一次 write 连发 MAIL FROM + 各 RCPT TO + DATA（PIPELINING）
+        mail = "MAIL FROM:<probe@probe.local>\r\n"
+        rcpt_cmds = [f"RCPT TO:<{addr}>\r\n" for addr in addresses]
+        pipeline = (mail + "".join(rcpt_cmds) + "DATA\r\n").encode()
+        writer.write(pipeline)
+        await writer.drain()
+        result["mail_from"] = "probe@probe.local"
+        log(f"PIPELINING 已发出: MAIL FROM + {len(rcpt_cmds)} 个 RCPT TO + DATA"
+            f"（{len(pipeline)} 字节，一次 write）")
+
+        # MAIL FROM 应答
+        code, lines = await read_with_deadline(reader)
+        if code != 250:
+            raise TrialError(f"MAIL FROM 被拒（{code}），终止试投")
+        log(f"MAIL FROM 应答 {code}")
+
+        # 逐个收齐 RCPT 应答并按原命令顺序配对（多行应答须整段收齐）
+        for addr in addresses:
+            code, lines = await read_with_deadline(reader)
+            policy = req.rcpt_policy[addr]
+            entry = {
+                "address": addr,
+                "configured_policy": policy,
+                "rcpt_code": code,
+                "rcpt_lines": lines,
+                "rcpt_multiline": len(lines) > 1,
+                "rcpt_status": ("accepted" if code == 250
+                                else "tempfail" if 400 <= code < 500
+                                else "reject"),
+                "final_status": None,   # 正文最终应答后的结论
+                "final_code": None,
+                "resendable": False,
+            }
+            recipients.append(entry)
+            log(f"RCPT {addr} 应答收齐: {code}"
+                + ("（多行）" if len(lines) > 1 else ""))
+
+        # DATA 应答：必须收到 354 才发正文
+        code, lines = await read_with_deadline(reader)
+        result["data_reply"] = {"code": code, "lines": lines}
+        if code != 354:
+            raise TrialError(f"DATA 未获 354（实际 {code}），不发送正文")
+        log("收到 354，开始发送正文")
+
+        body = (
+            "From: probe@probe.local\r\n"
+            f"To: {', '.join(addresses)}\r\n"
+            "Subject: 中继批量试投测试\r\n"
+            "\r\n"
+            "这是一封由探测台发出的试投邮件，用于核对中继对各收件地址的应答。\r\n"
+            ".\r\n"
+        ).encode()
+        writer.write(body)
+        await writer.drain()
+        log(f"正文已发完（{len(body)} 字节），等待最终应答")
+
+        # 正文最终应答：半条断连要标"待核"
+        code, lines, partial = await read_with_deadline(reader, final=True)
+        result["final_reply"] = {"code": code, "lines": lines, "partial": partial}
+        if code is None:
+            result["outcome"] = "final_incomplete"
+            log(f"最终应答不完整（断连），残行: {partial!r}")
+        elif code == 250:
+            result["outcome"] = "final_250"
+            log(f"正文最终应答 {code}，通过 RCPT 的地址判定为已接收")
+        elif 400 <= code < 500:
+            result["outcome"] = "final_tempfail"
+            log(f"正文最终应答 {code}（暂拒），通过 RCPT 的地址判定为暂拒")
+        else:
+            result["outcome"] = "final_reject"
+            log(f"正文最终应答 {code}（永久失败）")
+    except TrialError as e:
+        result["outcome"] = "pre_data_failed"
+        result["error"] = str(e)
+        log(f"试投提前终止: {e}")
+    except (EOFError, ConnectionResetError, BrokenPipeError) as e:
+        # 正文已发完后断连才算"待核"；更早的断连归为连接失败
+        if result["final_reply"] is None and result["data_reply"] is not None:
+            result["outcome"] = "final_incomplete"
+            result["final_reply"] = {
+                "code": None, "lines": [],
+                "partial": f"{type(e).__name__}: {e}"}
+            log("正文发完后连接中断，未收到完整最终应答")
+        else:
+            result["outcome"] = "connection_failed"
+            result["error"] = f"{type(e).__name__}: {e}"
+            log(f"连接失败: {type(e).__name__}: {e}")
+    except (asyncio.TimeoutError, TimeoutError) as e:
+        result["outcome"] = "timeout"
+        result["error"] = f"{type(e).__name__}: {e}"
+        log("试投超过总时限")
+    finally:
+        if writer is not None:
+            try:
+                writer.close()
+            except Exception:
+                pass
+            log("连接已释放")
+
+    # 汇总结论：RCPT 被拒/暂拒的保留原结论；RCPT 通过的以正文最终应答为准
+    resendable = []
+    for r in recipients:
+        if r["rcpt_status"] == "reject":
+            r["final_status"] = "reject"          # 永久拒收，保留原结论
+        elif r["rcpt_status"] == "tempfail":
+            r["final_status"] = "tempfail"        # 明确暂拒，保留原结论
+            r["resendable"] = True
+            resendable.append(r["address"])
+        else:  # RCPT 250 通过，结论看正文最终应答
+            if result["outcome"] == "final_250":
+                r["final_status"] = "accepted"
+            elif result["outcome"] == "final_tempfail":
+                r["final_status"] = "tempfail"
+            elif result["outcome"] == "final_reject":
+                r["final_status"] = "reject"
+            else:  # final_incomplete / timeout / 其他：待核
+                r["final_status"] = "unverified"
+        r["final_code"] = (result["final_reply"] or {}).get("code")
+    result["resendable"] = resendable
+    result["duration"] = now()
+    log(f"逐收件结论汇总完成，可重投 {len(resendable)} 个: {resendable}")
+    return result
 
 
 async def run_probe(req: ProbeReq) -> dict:
@@ -281,6 +522,58 @@ async def relay_state():
             except Exception as e:
                 out[key] = {"error": f"{type(e).__name__}: {e}"}
     return out
+
+
+@app.get("/api/trial-config")
+async def trial_config():
+    """首选中继上的样例地址清单、当前策略与正文最终应答模式。"""
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            r = await client.get(RELAYS["a"]["ctrl"] + "/state")
+            r.raise_for_status()
+            data = r.json()
+        return {
+            "relay": RELAYS["a"]["name"],
+            "addresses": data.get("addresses", []),
+            "rcpt_policy": data.get("state", {}).get("rcpt_policy", {}),
+            "data_final": data.get("state", {}).get("data_final", "accept"),
+            "data_final_choices": list(DATA_FINAL_CHOICES),
+        }
+    except Exception as e:
+        raise HTTPException(
+            502, f"无法读取 {RELAYS['a']['name']} 配置: {e}") from e
+
+
+@app.post("/api/trial")
+async def api_trial(req: TrialReq):
+    """批量试投：先把地址策略/最终应答模式下发首选 relay-a，再走一次完整 SMTP 事务。"""
+    async with probe_lock:
+        # 与探测接口共用锁：中继配置是全局的，串行避免互相改配置
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            try:
+                r = await client.post(
+                    RELAYS["a"]["ctrl"] + "/config",
+                    json={
+                        "rcpt_policy": req.rcpt_policy,
+                        "data_final": req.data_final,
+                        # 试投不受探测页遗留的延迟/复位配置影响
+                        "greeting_delay": 0.0,
+                        "response_delay": 0.0,
+                        "reset": False,
+                    })
+                r.raise_for_status()
+            except Exception as e:
+                raise HTTPException(
+                    502, f"无法配置 {RELAYS['a']['name']}: {e}") from e
+
+            result = await run_trial(req)
+
+            try:
+                r = await client.get(RELAYS["a"]["ctrl"] + "/state")
+                result["relay_stats"] = r.json().get("stats")
+            except Exception:
+                result["relay_stats"] = None
+            return result
 
 
 @app.post("/api/probe")
